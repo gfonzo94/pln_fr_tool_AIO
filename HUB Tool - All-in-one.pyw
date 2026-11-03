@@ -17180,7 +17180,7 @@ def _show_update_dialog(app):
             for _md_file in ("CHANGELOG.md", "ABOUT.md"):
                 try:
                     _md_resp = _req.get(
-                        f"https://raw.githubusercontent.com/dcurreli4/pln_fr_tool_AIO/main/{_md_file}",
+                        f"https://raw.githubusercontent.com/gfonzo94/pln_fr_tool_AIO/main/{_md_file}",
                         timeout=10,
                     )
                     if _md_resp.ok:
