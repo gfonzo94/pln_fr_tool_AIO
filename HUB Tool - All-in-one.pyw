@@ -173,7 +173,7 @@ def _check_update_available():
     try:
         import requests as _req
         resp = _req.get(
-            "https://api.github.com/repos/dcurreli4/pln_fr_tool_AIO/releases/latest",
+            "https://api.github.com/repos/gfonzo94/pln_fr_tool_AIO/releases/latest",
             timeout=5,
         )
         if resp.status_code != 200:
