@@ -7730,7 +7730,7 @@ def _zf_zip_folder(input_path, output_dir, log, cancel_event, filter_str="") -> 
         log(f"[WARN] Nessun file in '{input_path.name}', saltata.", "warn")
         return False
     log(f"[INFO] ZIP: '{input_path.name}' ({total} file)...", "info")
-    with _zipfile.ZipFile(zip_path, "w", _zipfile.ZIP_DEFLATED) as zf:
+    with _zipfile.ZipFile(zip_path, "w", _zipfile.ZIP_DEFLATED, compresslevel=1)) as zf:
         for i, file in enumerate(files, 1):
             if cancel_event.is_set():
                 log("[INFO] Operazione annullata.", "warn")
@@ -11417,7 +11417,7 @@ def generate_csv_files(template_map: Dict[str, Dict[str, InvoiceTemplate]]):
     for dt_key in files_per_dir:
         dt_dir = OUTPUT_DIR / dt_key
         zip_path = OUTPUT_DIR / f"{dt_key}.zip"
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=1)) as zf:
             for csv_file in dt_dir.glob("*.csv"):
                 zf.write(csv_file, csv_file.name)
     log.info("ZIP creati: %s", ", ".join(f"{dt}.zip" for dt in sorted(files_per_dir)))
@@ -12519,7 +12519,7 @@ class PaymentWriter(_AppBase):
             if all_written:
                 zip_path = output_dir / "payments.zip"
                 self.after(0, self._status_var.set, "Creazione ZIP...")
-                with _zf.ZipFile(zip_path, "w", _zf.ZIP_DEFLATED) as zf:
+                with _zf.ZipFile(zip_path, "w", _zf.ZIP_DEFLATED, compresslevel=1)) as zf:
                     for fpath in all_written:
                         full = output_dir / fpath
                         zf.write(full, Path(fpath).name)
