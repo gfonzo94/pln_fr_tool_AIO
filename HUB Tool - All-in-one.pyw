@@ -6364,10 +6364,24 @@ class QuadraturaHubSap(_AppBase):
                 total_rows = None
 
             # COPY a chunk
+            from psycopg2 import sql
+
             CHUNK = 50_000
-            cols_sql  = ", ".join(c.lower() for c in cols)
-            copy_sql  = (f"COPY {table} ({cols_sql}) FROM STDIN WITH "
-                         f"(FORMAT CSV, DELIMITER '{delimiter}', HEADER FALSE, NULL '')")
+            
+            # Usa i nomi canonici configurati per la tabella,
+            # mantenendo l'ordine delle colonne presenti nel CSV.
+            expected = self._CSV_EXPECTED_COLS[table]
+            column_map = {name.lower(): name for name in expected}
+            db_columns = [column_map[name.lower()] for name in cols]
+            
+            copy_sql = sql.SQL(
+                "COPY {} ({}) FROM STDIN WITH "
+                "(FORMAT CSV, DELIMITER {}, HEADER FALSE, NULL '')"
+            ).format(
+                sql.Identifier(table),
+                sql.SQL(", ").join(sql.Identifier(name) for name in db_columns),
+                sql.Literal(delimiter),
+            ).as_string(hub_conn)
             log(f"[INFO] COPY {table} in corso (chunk da {CHUNK:,} righe) ...", "info")
             t_copy       = time.time()
             rows_loaded  = 0
