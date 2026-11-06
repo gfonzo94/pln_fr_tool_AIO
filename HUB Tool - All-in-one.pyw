@@ -1,4 +1,4 @@
-﻿"""
+"""
 GUI_-_launcher.pyw  —  Launcher unificato: HUB Prod Sync + Kraken Data Extractor.
 Doppio clic per avviare su Windows (nessuna console).
 """
@@ -24,7 +24,7 @@ except Exception:
 
 
 
-VERSION_LAUNCHER = "1.9.0"
+VERSION_LAUNCHER = "1.9.1"
 
 
 _REQUIRED = {
@@ -15800,6 +15800,325 @@ _APPS = [
     },
 ]
 
+
+# Estrazione piani HUB: query personalizzate e CSV in sola lettura.
+class EstrazionePianiHub(_AppBase):
+    DEFAULTS = {
+        "estrai_piani": """SELECT DISTINCT reference,
+    CASE WHEN NULLIF(TRIM(agreement_id), '') IS NOT NULL
+         THEN TRIM(agreement_id) ELSE sap_plan_id END AS piano_hub
+FROM public.stg_vw_invoice_account_output;""",
+        "estrai_sum_amount": """SELECT DISTINCT reference, SUM(amount::numeric), document_type
+FROM public.stg_vw_invoice_account_output
+GROUP BY reference, document_type;""",
+    }
+    LABELS = {"estrai_piani": "Estrai piani", "estrai_sum_amount": "Estrai sum amount"}
+
+    def __init__(self, master):
+        super().__init__(master, bg=BG)
+        self._events = queue.Queue()
+        self._cancel = threading.Event()
+        self._lock = threading.Lock()
+        self._connection = None
+        self._busy = False
+        self._query_dir = _HERE / "input" / "estrazione piani hub" / "queries"
+        self._env = tkinter.StringVar(value="RECETTE")
+        self._activity = tkinter.StringVar(value="Estrai piani")
+        self._destination = tkinter.StringVar()
+        self._editors = {}
+        self._controls = []
+        self._build_status_bar()
+        self._status = self._status_var
+        self._build_notebook([
+            ("  \u25b6  Pipeline  ", self._build_extraction_tab),
+            ("  \u270e  Query  ", self._build_extraction_queries),
+        ])
+        self._set_busy(False)
+        self.after(100, self._poll)
+
+    def _section_title(self, parent, text):
+        Label(parent, text=text, bg=BG_CARD2, fg=TEXT_PRI,
+              font=("Consolas", 9, "bold"), padx=14, pady=10,
+              anchor="w").pack(fill="x")
+        Frame(parent, bg=BORDER, height=1).pack(fill="x")
+
+    def _radio(self, parent, text, variable, value):
+        control = tkinter.Radiobutton(
+            parent, text=text, variable=variable, value=value,
+            bg=BG_CARD, fg=TEXT_PRI, selectcolor=BG_INPUT,
+            activebackground=BG_CARD, activeforeground=TEXT_PRI,
+            disabledforeground=TEXT_SEC, font=("Consolas", 10),
+            anchor="w", cursor="hand2", highlightthickness=0,
+            padx=8, pady=5)
+        control.pack(fill="x", padx=8, pady=2)
+        self._controls.append(control)
+
+    def _build_extraction_tab(self, parent):
+        left, right = self._build_panel_layout(parent, left_width=245)
+        buttons = Frame(left, bg=BG_CARD)
+        buttons.pack(side="bottom", fill="x", padx=12, pady=12)
+        self._run_btn = self._button(buttons, "\u25b6  Avvia", lambda: self._start(False))
+        self._run_btn.pack(side="left", fill="x", expand=True)
+        self._stop_btn = self._button(buttons, "\u25a0  Stop", self._stop, color=ERROR)
+        self._stop_btn.pack(side="left", fill="x", expand=True)
+        self._section_title(left, "Modalità")
+        for title in self.LABELS.values():
+            self._radio(left, title, self._activity, title)
+        Frame(left, bg=BORDER, height=1).pack(fill="x", padx=14, pady=(10, 0))
+        self._section_title(left, "Ambiente")
+        for label, value in (("HUB Produzione", "HUB PRODUZIONE"),
+                             ("Integration", "INTEGRATION"), ("Recette", "RECETTE")):
+            self._radio(left, label, self._env, value)
+        Frame(left, bg=BORDER, height=1).pack(fill="x", padx=14, pady=(8, 0))
+        self._section_title(left, "Destinazione CSV")
+        Label(left, text="Percorso completo del file", bg=BG_CARD, fg=TEXT_SEC,
+              font=("Consolas", 8), anchor="w").pack(fill="x", padx=14, pady=(8, 4))
+        entry = tkinter.Entry(left, textvariable=self._destination, bg=BG_INPUT,
+            fg=TEXT_PRI, insertbackground=ACCENT, selectbackground=ACCENT2,
+            disabledbackground=BG_INPUT, disabledforeground=TEXT_SEC,
+            font=("Consolas", 9), relief="flat", highlightthickness=1,
+            highlightbackground=BORDER, highlightcolor=ACCENT)
+        entry.pack(fill="x", padx=14, ipady=5)
+        self._controls.append(entry)
+        browse = self._button(left, "\u2026  Scegli file CSV", self._browse)
+        browse.pack(fill="x", padx=14, pady=(4, 8))
+        self._controls.append(browse)
+        self._attach_tooltip(entry, "Percorso completo del CSV. Usa Scegli file CSV per cambiarlo.")
+        self._build_log_panel(right, on_clear=self._clear_extraction_log, log_attr="_log")
+
+    def _clear_extraction_log(self):
+        self._log.configure(state="normal")
+        self._log.delete("1.0", "end")
+        self._log.configure(state="disabled")
+
+    def _build_extraction_queries(self, parent):
+        nb = ttk.Notebook(parent, style="Dark.TNotebook")
+        nb.pack(fill="both", expand=True, padx=16, pady=12)
+        for key, title in self.LABELS.items():
+            tab = Frame(nb, bg=BG)
+            nb.add(tab, text="  " + title + "  ")
+            bar = Frame(tab, bg=BG_CARD)
+            bar.pack(side="bottom", fill="x", pady=(8, 0))
+            holder = Frame(tab, bg=BG_INPUT, highlightthickness=1, highlightbackground=BORDER)
+            holder.pack(fill="both", expand=True, pady=(8, 0))
+            sy = ttk.Scrollbar(holder, orient="vertical", style="Dark.Vertical.TScrollbar")
+            sx = ttk.Scrollbar(holder, orient="horizontal", style="Dark.Horizontal.TScrollbar")
+            sy.pack(side="right", fill="y")
+            sx.pack(side="bottom", fill="x")
+            editor = Text(holder, bg=BG_INPUT, fg=TEXT_PRI, insertbackground=ACCENT,
+                selectbackground=ACCENT2, font=("Consolas", 10), undo=True,
+                wrap="none", relief="flat", bd=0, padx=10, pady=8,
+                yscrollcommand=sy.set, xscrollcommand=sx.set)
+            editor.pack(fill="both", expand=True)
+            sy.configure(command=editor.yview)
+            sx.configure(command=editor.xview)
+            path = self._query_dir / (key + ".sql")
+            try:
+                self._query_dir.mkdir(parents=True, exist_ok=True)
+                if not path.exists():
+                    path.write_text(self.DEFAULTS[key], encoding="utf-8")
+                text = path.read_text(encoding="utf-8-sig")
+            except OSError as exc:
+                text = self.DEFAULTS[key]
+                self._events.put(("log", "Impossibile leggere la query personalizzata: " + str(exc)))
+            editor.insert("1.0", text)
+            self._editors[key] = editor
+            for caption, command in (
+                ("\u2714  Salva query", lambda k=key: self._save(k)),
+                ("Valida query", lambda k=key: self._start(True, k)),
+                ("Ripristina default", lambda k=key: self._restore(k)),
+            ):
+                btn = self._button(bar, caption, command)
+                btn.pack(side="left", padx=4)
+                self._controls.append(btn)
+
+
+    def _button(self, parent, caption, command, color=ACCENT):
+        button = self._make_btn(parent, caption, command, color=color)
+        button._eph_color = color
+        def invoke(event=None):
+            if str(button.cget("state")) != "disabled":
+                command()
+        button.bind("<Button-1>", invoke)
+        button.configure(disabledforeground=TEXT_SEC)
+        return button
+
+
+    def _key(self):
+        return next(k for k, label in self.LABELS.items() if label == self._activity.get())
+
+    def _browse(self):
+        path = filedialog.asksaveasfilename(parent=self, title="Destinazione CSV", defaultextension=".csv",
+            initialfile=self._key() + ".csv", filetypes=[("CSV", "*.csv")])
+        if path:
+            self._destination.set(path)
+
+    def _save(self, key):
+        try:
+            self._query_dir.mkdir(parents=True, exist_ok=True)
+            (self._query_dir / (key + ".sql")).write_text(self._editors[key].get("1.0", "end-1c"), encoding="utf-8")
+            self._events.put(("log", "Query salvata: " + key))
+        except OSError as exc:
+            messagebox.showerror("Salvataggio fallito", str(exc), parent=self)
+
+    def _restore(self, key):
+        if messagebox.askyesno("Ripristina default", "Sostituire la query nell'editor? Premi Salva per renderla persistente.", parent=self):
+            self._editors[key].delete("1.0", "end")
+            self._editors[key].insert("1.0", self.DEFAULTS[key])
+
+    def _set_busy(self, busy):
+        self._busy = busy
+        for control in self._controls:
+            control.configure(state="disabled" if busy else "normal")
+            if isinstance(control, tkinter.Label):
+                control.configure(cursor="arrow" if busy else "hand2")
+        for editor in self._editors.values():
+            editor.configure(state="disabled" if busy else "normal")
+        self._run_btn.configure(state="disabled" if busy else "normal", cursor="arrow" if busy else "hand2")
+        self._stop_btn.configure(state="normal" if busy else "disabled", cursor="hand2" if busy else "arrow")
+
+
+    def _start(self, validate=False, key=None):
+        if self._busy:
+            return
+        key = key or self._key()
+        query = self._editors[key].get("1.0", "end-1c").strip()
+        # Una subquery impedisce sequenze SQL multiple; il DB verifica la sintassi.
+        if query.endswith(";"):
+            query = query[:-1].rstrip()
+        if not query:
+            messagebox.showerror("Query vuota", "Inserisci una query SELECT.", parent=self)
+            return
+        path = None
+        if not validate:
+            if not self._destination.get().strip():
+                self._browse()
+            if not self._destination.get().strip():
+                return
+            path = Path(self._destination.get().strip()).expanduser().resolve()
+            if not path.parent.is_dir() or path.is_dir():
+                messagebox.showerror("Destinazione non valida", "Scegli un file in una cartella esistente.", parent=self)
+                return
+            if path.exists() and not messagebox.askyesno("Sovrascrittura", "Sostituire il file esistente?", parent=self):
+                return
+        self._cancel.clear()
+        self._set_busy(True)
+        self._status.set("Validazione..." if validate else "Estrazione in corso...")
+        threading.Thread(target=self._worker, args=(self._env.get(), key, query, path, validate), daemon=True).start()
+
+    def _stop(self):
+        self._cancel.set()
+        self._stop_btn.configure(state="disabled")
+        self._events.put(("log", "Stop richiesto; annullamento query in corso..."))
+        def cancel():
+            with self._lock:
+                conn = self._connection
+                if conn is not None:
+                    try:
+                        conn.cancel()
+                    except Exception as exc:
+                        self._events.put(("log", "Annullamento: " + str(exc)))
+        threading.Thread(target=cancel, daemon=True).start()
+
+    def _worker(self, env, key, query, destination, validate):
+        import csv
+        import tempfile
+        import time
+        conn = tunnel = temporary = None
+        started = time.monotonic()
+        outcome = "Errore."
+        try:
+            self._events.put(("log", env + " - " + self.LABELS[key] + (" (validazione)" if validate else "")))
+            _reload_env()
+            if env == "HUB PRODUZIONE":
+                conn = get_hub_connection()
+            else:
+                tunnel = open_ssh_tunnel(env)
+                if self._cancel.is_set():
+                    raise InterruptedError()
+                conn = get_target_connection(tunnel, env)
+            with self._lock:
+                self._connection = conn
+            conn.set_session(readonly=True, autocommit=False)
+            if self._cancel.is_set():
+                raise InterruptedError()
+            wrapped = "SELECT * FROM (\n" + query + "\n) AS hub_export_result"
+            if validate:
+                with conn.cursor() as cur:
+                    cur.execute("SET LOCAL statement_timeout = '30s'")
+                    cur.execute("EXPLAIN " + wrapped)
+                self._events.put(("log", "Query valida: piano ottenuto senza eseguire l'estrazione. I valori non sono stati verificati."))
+                outcome = "Validazione completata."
+            else:
+                with conn.cursor(name="hub_plans_export") as cur:
+                    cur.itersize = 10000
+                    cur.execute(wrapped)
+                    rows = cur.fetchmany(10000)
+                    headers = [column[0] for column in cur.description]
+                    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8-sig", newline="", delete=False,
+                        dir=str(destination.parent), prefix=".hub_export_", suffix=".tmp") as output:
+                        temporary = Path(output.name)
+                        writer = csv.writer(output, delimiter=";")
+                        writer.writerow(headers)
+                        count = 0
+                        while rows:
+                            if self._cancel.is_set():
+                                raise InterruptedError()
+                            writer.writerows(rows)
+                            count += len(rows)
+                            self._events.put(("log", "Righe esportate: " + format(count, ",")))
+                            rows = cur.fetchmany(10000)
+                    if self._cancel.is_set():
+                        raise InterruptedError()
+                os.replace(str(temporary), str(destination))
+                temporary = None
+                self._events.put(("log", f"CSV completato: {destination} | {count:,} righe | {time.monotonic()-started:.1f}s"))
+                if not count:
+                    self._events.put(("log", "Nessun risultato: CSV contenente soltanto le intestazioni."))
+                outcome = "Completato."
+        except Exception as exc:
+            if self._cancel.is_set() or isinstance(exc, InterruptedError):
+                outcome = "Annullato."
+            self._events.put(("log", outcome + (" " + str(exc) if str(exc) else "")))
+        finally:
+            with self._lock:
+                self._connection = None
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+            if tunnel is not None:
+                try:
+                    tunnel.stop()
+                except Exception as exc:
+                    self._events.put(("log", "Chiusura tunnel: " + str(exc)))
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError as exc:
+                    self._events.put(("log", "Pulizia file temporaneo: " + str(exc)))
+            self._events.put(("done", outcome))
+
+    def _poll(self):
+        try:
+            for _ in range(100):
+                kind, text = self._events.get_nowait()
+                if kind == "done":
+                    self._set_busy(False)
+                    self._status.set(text)
+                else:
+                    self._log.configure(state="normal")
+                    self._log.insert("end", text + "\n")
+                    self._log.see("end")
+                    self._log.configure(state="disabled")
+        except queue.Empty:
+            pass
+        self.after(100, self._poll)
+
+
+_APPS.append({"key": "hubplansextract", "icon": "⇩", "label": "Estrazione piani HUB", "minsize": (820, 560), "size": (1000, 720), "class": EstrazionePianiHub})
+
 def _apply_dark_titlebar(hwnd, bg_hex: str = "#0f1117"):
     """Applica la title bar scura via DWM API (Windows 10 1903+ / Windows 11)."""
     try:
@@ -16875,7 +17194,7 @@ class Launcher(_TkDnD.Tk if _HAS_DND else tkinter.Tk):
         tkinter.Frame(sb, bg=_SB_BORDER, height=1).pack(fill="x")
 
         _SB_GROUPS = [
-            ("db",   "🗄", "DATABASE", ["hubconsole", "hub", "kraken", "analysis", "delta", "quadratura", "bonifica", "hfupdater"]),
+            ("db",   "🗄", "DATABASE", ["hubconsole", "hub", "kraken", "analysis", "delta", "quadratura", "hubplansextract", "bonifica", "hfupdater"]),
             ("file", "📁", "FILE",     ["cleaner", "mover", "zipper", "ppfilter", "csvremover", "invoicewriter", "paymentwriter", "validator"]),
             ("jira", "🎫", "JIRA",     ["jira"]),
         ]
