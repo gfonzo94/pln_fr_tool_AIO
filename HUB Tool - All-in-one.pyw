@@ -24,7 +24,7 @@ except Exception:
 
 
 
-VERSION_LAUNCHER = "1.9.1"
+VERSION_LAUNCHER = "1.9.2"
 
 
 _REQUIRED = {
@@ -391,6 +391,13 @@ SETTINGS_TABS = [
             ("PAY_COL_REFERENCE",    "Reference col",         False),
             ("PAY_COL_AMOUNT",       "Amount col",            False),
             ("PAY_COL_PAYMENT_DATE", "Payment Date col",      False),
+        ]),
+        ("Payment B2B", [
+            ("PAY_B2B_OUTPUT_SUBFOLDER", "Sottocartella output", False),
+            ("PAY_B2B_ZIP_FILENAME",     "Nome ZIP",              False),
+            ("PAY_B2B_COL_REFERENCE",    "Reference col",         False),
+            ("PAY_B2B_COL_AMOUNT",       "Amount col",            False),
+            ("PAY_B2B_COL_PAYMENT_DATE", "Payment Date col",      False),
         ]),
     ]),
 ]
@@ -8448,6 +8455,165 @@ _PAY_DEFAULTS = {
 }
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAYMENT B2B FILTER
+# ══════════════════════════════════════════════════════════════════════════════
+
+_PAY_B2B_BASE                  = _HERE / "input" / "file filter" / "payment b2b"
+_PAY_B2B_FILTER_FILE_SIMPLE    = _PAY_B2B_BASE / "filter_payment_b2b_reference.txt"
+_PAY_B2B_FILTER_FILE_COMPOSITE = _PAY_B2B_BASE / "filter_payment_b2b_key_ref_date_type.txt"
+
+_PAY_B2B_DEFAULTS = {
+    "PAY_B2B_OUTPUT_SUBFOLDER": "output/payment b2b",
+    "PAY_B2B_ZIP_FILENAME":     "payment_b2b.zip",
+    "PAY_B2B_FILTER_MODE":      "key_ref_date_type",
+    "PAY_B2B_DEBUG_KEYS":       "false",
+    "PAY_B2B_COL_REFERENCE":    "12",
+    "PAY_B2B_COL_AMOUNT":       "8",
+    "PAY_B2B_COL_PAYMENT_DATE": "9",
+}
+
+
+def _pay_b2b_get(key):
+    return _read_env_raw().get(key, _PAY_B2B_DEFAULTS.get(key, ""))
+
+
+def pay_b2b_run_pipeline(cfg_data, log_fn, on_done):
+    try:
+        import shutil as _sh, re as _re
+
+        input_folder = Path(cfg_data["input_folder"]).resolve()
+        output_folder = (
+            _HERE / "output" / "file filter" / "payment b2b" / "_work"
+        )
+
+        zip_out_dir = _HERE / "output" / "file filter" / "payment b2b"
+        zip_out_dir.mkdir(parents=True, exist_ok=True)
+        zip_path = zip_out_dir / cfg_data["zip_filename"]
+
+        if not input_folder.is_dir():
+            log_fn(f"[ERRORE] Cartella input non trovata: {input_folder}", "error")
+            on_done(success=False)
+            return
+
+        filter_file = (
+            _PAY_B2B_FILTER_FILE_SIMPLE
+            if cfg_data.get("filter_mode") == "reference"
+            else _PAY_B2B_FILTER_FILE_COMPOSITE
+        )
+
+        if not filter_file.is_file():
+            log_fn(f"[ERRORE] File filtro non trovato: {filter_file}", "error")
+            on_done(success=False)
+            return
+
+        if output_folder.exists():
+            _sh.rmtree(output_folder)
+        output_folder.mkdir(parents=True)
+        log_fn(f"[INFO] Cartella output: {output_folder}", "info")
+
+        filter_set = set()
+        with filter_file.open("r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if s:
+                    filter_set.add(s)
+
+        log_fn(f"[INFO] Filtro caricato: {len(filter_set)} chiavi", "info")
+
+        b2b_re = _re.compile(
+            r"^(KE|KG)_[A-Z0-9]+_BC\d+_\d{8}\.csv$",
+            _re.IGNORECASE,
+        )
+        b2c_re = _re.compile(
+            r"^(KE|KG)_[A-Z0-9]{2}_[A-Z]_\d{10}_\d{8}\.csv$",
+            _re.IGNORECASE,
+        )
+
+        all_files = [p for p in input_folder.iterdir() if p.is_file()]
+        b2b_files = [p for p in all_files if b2b_re.match(p.name)]
+        b2c_files = [p for p in all_files if b2c_re.match(p.name)]
+
+        if b2c_files:
+            log_fn(
+                "[ERRORE] File B2C rilevati nella cartella B2B: "
+                "B2B e B2C non possono coesistere nella stessa esecuzione.",
+                "error",
+            )
+            _sh.rmtree(output_folder, ignore_errors=True)
+            on_done(success=False)
+            return
+
+        if not b2b_files:
+            log_fn(
+                "[ERRORE] Nessun file Payment B2B trovato nella cartella input.",
+                "error",
+            )
+            _sh.rmtree(output_folder, ignore_errors=True)
+            on_done(success=False)
+            return
+
+        log_fn(f"[INFO] Trovati {len(b2b_files)} file Payment B2B.", "info")
+        cfg_data["header_amount_in_cents"] = True
+
+        output_files = []
+        total_kept = 0
+        total_rows = 0
+        total_amount = 0.0
+
+        for input_path in sorted(b2b_files):
+            output_path = output_folder / input_path.name
+
+            kept, amount, rows, kept_keys = _pay_process_file(
+                input_path,
+                filter_set,
+                output_path,
+                cfg_data,
+                log_fn,
+            )
+
+            if kept > 0:
+                output_files.append(output_path)
+                total_kept += kept
+                total_rows += rows
+                total_amount += amount
+
+        if not output_files:
+            log_fn("[WARN] Nessuna riga B2B corrisponde al filtro.", "warn")
+            _sh.rmtree(output_folder, ignore_errors=True)
+            log_fn("\n[INFO] Completato: nessun output generato.", "info")
+            on_done(success=True)
+            return
+
+        log_fn(
+            f"[INFO] Riepilogo: {total_rows} righe originali / "
+            f"{total_kept} mantenute / {total_amount:.2f} totale amount.",
+            "info",
+        )
+
+        import zipfile as _zf
+        log_fn(f"\n[INFO] ZIP: {zip_path.name} ...", "info")
+
+        with _zf.ZipFile(
+            zip_path,
+            "w",
+            _zf.ZIP_DEFLATED,
+            compresslevel=1,
+        ) as zf:
+            for file in output_files:
+                zf.write(file, file.relative_to(output_folder))
+
+        log_fn(f"[OK] ZIP creato: {zip_path}", "ok")
+        _sh.rmtree(output_folder, ignore_errors=True)
+
+        log_fn("\n[INFO] Completato con successo.", "ok")
+        on_done(success=True)
+
+    except Exception as e:
+        log_fn(f"\n[ERRORE CRITICO] {e}", "error")
+        on_done(success=False)
+
 def _pay_get(key):
     return _read_env_raw().get(key, _PAY_DEFAULTS.get(key, ""))
 
@@ -8534,7 +8700,10 @@ def _pay_process_file(input_path, filter_set, output_path, cfg, log_fn):
 
         header_columns = header.split(";")
         if len(header_columns) >= 4:
-            header_columns[3] = _pay_format_header_amount(sum_amount)
+            if cfg.get("header_amount_in_cents"):
+                header_columns[3] = str(int(round(sum_amount * 100)))
+            else:
+                header_columns[3] = _pay_format_header_amount(sum_amount)
             header_columns[1] = str(total_kept)
 
         output_lines.insert(0, ";".join(header_columns))
@@ -8655,15 +8824,19 @@ class FileFilter(_AppBase):
         self._filter_counts = {}
         self._pay_log_queue = queue.Queue()
         self._pay_running    = False
+        self._pay_b2b_log_queue = queue.Queue()
+        self._pay_b2b_running   = False
         self._inv_log_queue  = queue.Queue()
         self._inv_running    = False
         self._build_ui()
         self._load_fields()
         self._load_all_filters()
         self._load_pay_filter()
+        self._load_pay_b2b_filter()
         self._load_inv_filters()
         self._poll_log()
         self._poll_pay_log()
+        self._poll_pay_b2b_log()
 
     @property
     def _btn_data(self): return True
@@ -8712,6 +8885,10 @@ class FileFilter(_AppBase):
         pay_tab = Frame(sub_nb, bg=BG)
         sub_nb.add(pay_tab, text="  Payments  ")
         self._build_payment_subtab(pay_tab)
+
+        pay_b2b_tab = Frame(sub_nb, bg=BG)
+        sub_nb.add(pay_b2b_tab, text="  Payment B2B  ")
+        self._build_payment_b2b_subtab(pay_b2b_tab)
 
     def _build_payment_plans_subtab(self, parent):
         body = Frame(parent, bg=BG)
@@ -8928,6 +9105,118 @@ class FileFilter(_AppBase):
         self._build_pay_log_panel(log_frame, on_clear=self._pay_clear_log)
         self._update_pay_input_label()
 
+    def _build_payment_b2b_subtab(self, parent):
+        body = Frame(parent, bg=BG)
+        body.pack(fill="both", expand=True)
+
+        top = Frame(body, bg=BG_CARD, bd=0, highlightthickness=1,
+                    highlightbackground=BORDER)
+        top.pack(fill="x", pady=(0, 8))
+
+        hdr = Frame(top, bg=BG_CARD)
+        hdr.pack(fill="x")
+        Label(hdr, text="ESECUZIONE", bg=BG_CARD, fg=TEXT_SEC,
+              font=("Consolas", 9, "bold"), pady=10, padx=14).pack(side="left")
+
+        self._pay_b2b_btn = self._make_icon_btn(hdr, "▶", self._pay_b2b_start, ACCENT, "Avvia pipeline")
+        self._pay_b2b_btn.pack(side="right", padx=(0, 8))
+        Frame(top, bg=BORDER, height=1).pack(fill="x", padx=14)
+
+        row1 = Frame(top, bg=BG_CARD)
+        row1.pack(fill="x", padx=14, pady=(8, 4))
+        Label(row1, text="Cartella input:", bg=BG_CARD, fg=TEXT_SEC,
+              font=("Consolas", 9), width=14, anchor="w").pack(side="left")
+        browse_btn = Label(row1, text="\U0001f4c1", bg=BG_CARD, fg=TEXT_SEC,
+                           font=("Consolas", 11), cursor="hand2", padx=4)
+        browse_btn.pack(side="left")
+        self._pay_b2b_input_lbl = Label(row1, text="—", bg=BG_CARD, fg=ACCENT,
+                                font=("Consolas", 9), anchor="w")
+        self._pay_b2b_input_lbl.pack(side="left", fill="x", expand=True)
+
+        def _browse_input(e=None):
+            folder = filedialog.askdirectory(title="Seleziona cartella input")
+            if folder:
+                _write_env({"PAY_INPUT_FOLDER": folder})
+                self._update_pay_b2b_input_label()
+
+        browse_btn.bind("<Button-1>", _browse_input)
+        self._pay_b2b_input_lbl.bind("<Button-1>", _browse_input)
+
+        dz_frame = Frame(top, bg=BG_CARD)
+        dz_frame.pack(fill="x", padx=8, pady=(0, 4))
+        self._build_drop_zone(dz_frame, "_pay_b2b_drop_zone",
+                              "\U0001f4c2  Trascina qui la cartella input",
+                              _browse_input, self._on_pay_b2b_dnd_drop)
+
+        row2 = Frame(top, bg=BG_CARD)
+        row2.pack(fill="x", padx=14, pady=(0, 8))
+        Label(row2, text="Chiave filtro:", bg=BG_CARD, fg=TEXT_SEC,
+              font=("Consolas", 9), width=14, anchor="w").pack(side="left")
+        self._pay_b2b_mode_var = tkinter.StringVar()
+        mode_btn = Frame(row2, bg=BG_INPUT, highlightthickness=1,
+                       highlightbackground=BORDER, cursor="hand2")
+        mode_btn.pack(side="left")
+        mode_lbl = Label(mode_btn, textvariable=self._pay_b2b_mode_var, bg=BG_INPUT, fg=TEXT_PRI,
+                       font=("Consolas", 9), padx=10, pady=4, width=32, anchor="w")
+        mode_lbl.pack(side="left")
+        Label(mode_btn, text="▾", bg=BG_INPUT, fg=TEXT_SEC,
+              font=("Consolas", 9), padx=6).pack(side="left")
+
+        _PAY_MODE_OPTIONS = ["Reference", "Reference + Data + Tipo (PAYMENT/REJECT)"]
+        _PAY_MODE_MAP     = {"Reference": "reference",
+                              "Reference + Data + Tipo (PAYMENT/REJECT)": "key_ref_date_type"}
+        _PAY_MODE_MAP_INV = {v: k for k, v in _PAY_MODE_MAP.items()}
+
+        def _open_mode_menu(e=None):
+            menu = tkinter.Menu(self, tearoff=0, bg=BG_CARD2, fg=TEXT_PRI,
+                                activebackground=ACCENT2, activeforeground=TEXT_PRI,
+                                font=("Consolas", 9), bd=0, relief="flat")
+            for opt in _PAY_MODE_OPTIONS:
+                menu.add_command(label=opt, command=lambda o=opt: (
+                    self._pay_b2b_mode_var.set(o),
+                    _write_env({"PAY_B2B_FILTER_MODE": _PAY_MODE_MAP.get(o, o)})))
+            menu.post(mode_btn.winfo_rootx(),
+                      mode_btn.winfo_rooty() + mode_btn.winfo_height())
+
+        mode_btn.bind("<Button-1>", _open_mode_menu)
+        mode_lbl.bind("<Button-1>", _open_mode_menu)
+        self._pay_b2b_mode_map_inv = _PAY_MODE_MAP_INV
+        mode = _pay_b2b_get("PAY_B2B_FILTER_MODE") or "key_ref_date_type"
+        self._pay_b2b_mode_var.set(_PAY_MODE_MAP_INV.get(mode, "Reference + Data + Tipo (PAYMENT/REJECT)"))  # noqa: E501
+
+        # Debug chiavi
+        row3 = Frame(top, bg=BG_CARD)
+        row3.pack(fill="x", padx=14, pady=(0, 10))
+        self._pay_b2b_debug_var = tkinter.BooleanVar(
+            value=_pay_b2b_get("PAY_B2B_DEBUG_KEYS").lower() == "true")
+        self._pay_b2b_debug_box = Label(row3,
+                              text="☑" if self._pay_b2b_debug_var.get() else "☐",
+                              bg=BG_CARD,
+                              fg=ACCENT if self._pay_b2b_debug_var.get() else TEXT_SEC,
+                              font=("Consolas", 12), cursor="hand2", width=2)
+        self._pay_b2b_debug_box.pack(side="left", padx=(0, 6))
+        debug_lbl = Label(row3, text="Debug chiavi (stampa chiavi generate e match nel log)",
+                        bg=BG_CARD, fg=TEXT_PRI, font=("Consolas", 10),
+                        cursor="hand2")
+        debug_lbl.pack(side="left")
+
+        def _toggle_debug(e=None):
+            val = not self._pay_b2b_debug_var.get()
+            self._pay_b2b_debug_var.set(val)
+            self._pay_b2b_debug_box.configure(text="☑" if val else "☐",
+                                    fg=ACCENT if val else TEXT_SEC)
+            _write_env({"PAY_B2B_DEBUG_KEYS": "true" if val else "false"})
+
+        self._pay_b2b_debug_box.bind("<Button-1>", _toggle_debug)
+        debug_lbl.bind("<Button-1>", _toggle_debug)
+        row3.bind("<Button-1>", _toggle_debug)
+
+        log_frame = Frame(body, bg=BG_CARD, bd=0, highlightthickness=1,
+                          highlightbackground=BORDER)
+        log_frame.pack(fill="both", expand=True)
+        self._build_pay_b2b_log_panel(log_frame, on_clear=self._pay_b2b_clear_log)
+        self._update_pay_b2b_input_label()
+
     def _build_invoice_subtab(self, parent):
         body = Frame(parent, bg=BG)
         body.pack(fill="both", expand=True)
@@ -9025,6 +9314,10 @@ class FileFilter(_AppBase):
         sub_nb.add(pay_tab, text="  Payments  ")
         self._build_filter_payment_subtab(pay_tab)
 
+        pay_b2b_tab = Frame(sub_nb, bg=BG)
+        sub_nb.add(pay_b2b_tab, text="  Payment B2B  ")
+        self._build_filter_payment_b2b_subtab(pay_b2b_tab)
+
     def _build_filter_payment_plans_subtab(self, parent):
         sub_nb = ttk.Notebook(parent, style="PPSub.TNotebook")
         sub_nb.pack(fill="both", expand=True)
@@ -9106,6 +9399,69 @@ class FileFilter(_AppBase):
         )
 
     def _build_pay_filter_key_tab(self, parent, label, attr_tree, attr_count,
+                                   paste_cmd, clear_cmd):
+        hdr = Frame(parent, bg=BG)
+        hdr.pack(fill="x", padx=16, pady=(12, 0))
+        Label(hdr, text=label, bg=BG, fg=TEXT_PRI,
+              font=("Consolas", 11, "bold")).pack(side="left")
+        Frame(parent, bg=BORDER, height=1).pack(fill="x", padx=16, pady=(8, 0))
+        Label(parent, text="Ogni riga rappresenta una chiave da mantenere nel filtraggio.",
+              bg=BG, fg=TEXT_SEC, font=("Consolas", 9), anchor="w",
+              pady=6).pack(fill="x", padx=16)
+
+        toolbar = Frame(parent, bg=BG)
+        toolbar.pack(fill="x", padx=16, pady=(0, 6))
+        self._make_btn(toolbar, "✏️  Modifica / Aggiungi",
+                       paste_cmd, color=SUCCESS).pack(side="left", padx=(0, 6))
+        self._make_btn(toolbar, "\U0001f5d1  Svuota righe",
+                       clear_cmd, color=ERROR).pack(side="left")
+
+        table_frame = Frame(parent, bg=BG_CARD,
+                            highlightthickness=1, highlightbackground=BORDER)
+        table_frame.pack(fill="both", expand=True, padx=16, pady=(0, 4))
+
+        tree = ttk.Treeview(table_frame, columns=("id",), show="headings",
+                            style="PPFilter.Treeview", selectmode="browse")
+        tree.heading("id", text="Chiave Filtro")
+        tree.column("id", width=500, minwidth=200, anchor="w")
+        vsb = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview,
+                            style="Dark.Vertical.TScrollbar")
+        vsb.pack(side="right", fill="y")
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(fill="both", expand=True)
+        setattr(self, attr_tree, tree)
+
+        count_var = tkinter.StringVar(value="")
+        setattr(self, attr_count, count_var)
+        Label(parent, textvariable=count_var, bg=BG, fg=TEXT_SEC,
+              font=("Consolas", 9), anchor="w",
+              pady=4).pack(fill="x", padx=16)
+
+    def _build_filter_payment_b2b_subtab(self, parent):
+        sub_nb = ttk.Notebook(parent, style="PPSub.TNotebook")
+        sub_nb.pack(fill="both", expand=True)
+
+        tab_simple = Frame(sub_nb, bg=BG)
+        sub_nb.add(tab_simple, text="  Reference  ")
+        self._build_pay_b2b_filter_key_tab(
+            tab_simple, "Reference",
+            attr_tree="_pay_b2b_filter_tree_simple",
+            attr_count="_pay_b2b_filter_count_var_simple",
+            paste_cmd=self._pay_b2b_filter_paste_popup_simple,
+            clear_cmd=self._pay_b2b_filter_clear_all_simple,
+        )
+
+        tab_composite = Frame(sub_nb, bg=BG)
+        sub_nb.add(tab_composite, text="  Reference + Data + Tipo (PAYMENT/REJECT)  ")
+        self._build_pay_b2b_filter_key_tab(
+            tab_composite, "Reference + Data + Tipo (PAYMENT/REJECT)",
+            attr_tree="_pay_b2b_filter_tree_composite",
+            attr_count="_pay_b2b_filter_count_var_composite",
+            paste_cmd=self._pay_b2b_filter_paste_popup_composite,
+            clear_cmd=self._pay_b2b_filter_clear_all_composite,
+        )
+
+    def _build_pay_b2b_filter_key_tab(self, parent, label, attr_tree, attr_count,
                                    paste_cmd, clear_cmd):
         hdr = Frame(parent, bg=BG)
         hdr.pack(fill="x", padx=16, pady=(12, 0))
@@ -9427,6 +9783,88 @@ class FileFilter(_AppBase):
 
     # ── Fields / config ───────────────────────────────────────────────────
 
+    def _load_pay_b2b_filter(self):
+        self._load_pay_b2b_filter_for(
+            "_pay_b2b_filter_tree_simple",    "_pay_b2b_filter_count_var_simple",
+            _PAY_B2B_FILTER_FILE_SIMPLE)
+        self._load_pay_b2b_filter_for(
+            "_pay_b2b_filter_tree_composite", "_pay_b2b_filter_count_var_composite",
+            _PAY_B2B_FILTER_FILE_COMPOSITE)
+
+    def _load_pay_b2b_filter_for(self, attr_tree, attr_count, filter_file):
+        tree = getattr(self, attr_tree, None)
+        if not tree:
+            return
+        self._load_filter_from_file(tree, filter_file, getattr(self, attr_count))
+
+    def _pay_b2b_filter_paste_popup_simple(self):
+        self._pay_b2b_filter_paste_popup_for(
+            "_pay_b2b_filter_tree_simple", "_pay_b2b_filter_count_var_simple",
+            _PAY_B2B_FILTER_FILE_SIMPLE, "Reference")
+
+    def _pay_b2b_filter_paste_popup_composite(self):
+        self._pay_b2b_filter_paste_popup_for(
+            "_pay_b2b_filter_tree_composite", "_pay_b2b_filter_count_var_composite",
+            _PAY_B2B_FILTER_FILE_COMPOSITE, "Reference + Data + Tipo (PAYMENT/REJECT)")
+
+    def _pay_b2b_filter_paste_popup_for(self, attr_tree, attr_count, filter_file, label):
+        import re as _re
+        tree      = getattr(self, attr_tree)
+        count_var = getattr(self, attr_count)
+
+        if filter_file == _PAY_B2B_FILTER_FILE_COMPOSITE:
+            _key_re   = _re.compile(r'^R.+D\d{8}T(PAYMENT|REJECT|)$')
+            _key_ok   = lambda k: bool(_key_re.match(k)) and ' ' not in k
+            _fmt_hint = 'Formato atteso: R{ref}D{YYYYMMDD}T{PAYMENT|REJECT|""}'
+        else:
+            _key_re   = _re.compile(r'^[A-Za-z0-9_]+$')
+            _key_ok   = lambda k: bool(_key_re.match(k))
+            _fmt_hint = "Solo lettere, cifre e _ (niente spazi, - o altri caratteri speciali)"
+
+        def _validate(raw):
+            stripped     = [(i, line.strip()) for i, line in enumerate(raw) if line.strip()]
+            invalid_nos  = [i + 1 for i, k in stripped if not _key_ok(k)]
+            valid        = [k for i, k in stripped if _key_ok(k)]
+            n = len(invalid_nos)
+            error_msg = (f"\u26a0  {n} {'chiave non valida' if n == 1 else 'chiavi non valide'}.\n{_fmt_hint}"
+                         if invalid_nos else "")
+            return valid, invalid_nos, error_msg
+
+        self._paste_popup(
+            title=f"Modifica / Aggiungi \u2014 {label}",
+            subtitle="Una chiave per riga. Righe vuote verranno ignorate.",
+            tree=tree, count_var=count_var,
+            empty_warning="\u26a0  Nessuna chiave trovata.",
+            count_label_fn=lambda n: f"{n} chiavi.",
+            save_fn=lambda: self._save_pay_b2b_filter_for(attr_tree, filter_file),
+            validate_fn=_validate,
+        )
+
+    def _pay_b2b_filter_clear_all_simple(self):
+        self._pay_b2b_filter_clear_all_for(
+            "_pay_b2b_filter_tree_simple", "_pay_b2b_filter_count_var_simple",
+            _PAY_B2B_FILTER_FILE_SIMPLE)
+
+    def _pay_b2b_filter_clear_all_composite(self):
+        self._pay_b2b_filter_clear_all_for(
+            "_pay_b2b_filter_tree_composite", "_pay_b2b_filter_count_var_composite",
+            _PAY_B2B_FILTER_FILE_COMPOSITE)
+
+    def _pay_b2b_filter_clear_all_for(self, attr_tree, attr_count, filter_file):
+        tree      = getattr(self, attr_tree)
+        count_var = getattr(self, attr_count)
+        if not tree.get_children():
+            return
+        if messagebox.askyesno("Svuota filtro", "Rimuovere tutte le chiavi?"):
+            tree.delete(*tree.get_children())
+            count_var.set("0 chiavi.")
+            self._save_pay_b2b_filter_for(attr_tree, filter_file)
+
+    def _save_pay_b2b_filter_for(self, attr_tree, filter_file):
+        self._save_filter_to_file(getattr(self, attr_tree), filter_file)
+
+    # ── Fields / config ───────────────────────────────────────────────────
+
     def _load_fields(self):
         fk = _pp_get("PP_FILTER_KEY") or "plan_id"
         self._fk_var.set(_PP_FILTER_KEY_MAP_INV.get(fk, "Agreement ID"))
@@ -9614,6 +10052,112 @@ class FileFilter(_AppBase):
         threading.Thread(
             target=pay_run_pipeline,
             args=(cfg, self._pay_enqueue_log, self._pay_on_done),
+            daemon=True,
+        ).start()
+
+    # ── Invoice helpers ───────────────────────────────────────────────────
+
+    def _on_pay_b2b_dnd_drop(self, event):
+        import re
+        paths = [p[0] or p[1] for p in re.findall(r'\{([^}]+)\}|(\S+)', event.data)]
+        dirs = [p.strip() for p in paths if os.path.isdir(p.strip())]
+        if not dirs:
+            return
+        if len(dirs) > 1:
+            messagebox.showwarning("Cartella input", "Trascina una sola cartella.")
+            return
+        _write_env({"PAY_INPUT_FOLDER": dirs[0]})
+        self._update_pay_b2b_input_label()
+
+    def _update_pay_b2b_input_label(self):
+        val = _pay_b2b_get("PAY_INPUT_FOLDER").strip()
+        if val and len(val) > 55:
+            display = "…" + val[-52:]
+        else:
+            display = val if val else "—"
+        self._pay_b2b_input_lbl.configure(text=display,
+                                  fg=ACCENT if val else TEXT_SEC)
+
+    def _build_pay_b2b_log_panel(self, parent, on_clear=None):
+        self._build_log_panel(parent, on_clear=on_clear, log_attr="_pay_b2b_log_box")
+
+    def _pay_b2b_clear_log(self):
+        self._clear_log_for("_pay_b2b_log_box")
+
+    def _pay_b2b_enqueue_log(self, message: str, level: str = "info"):
+        self._enqueue_log_for(message, level, "_pay_b2b_log_queue")
+
+    def _poll_pay_b2b_log(self):
+        self._poll_log_for("_pay_b2b_log_box", "_pay_b2b_log_queue")
+        self.after(80, self._poll_pay_b2b_log)
+
+    def _pay_b2b_on_done(self, success):
+        self._pay_b2b_running = False
+        color = SUCCESS if success else ERROR
+        self._status_var.set(
+            "✓ Completato con successo." if success else "✗ Terminato con errori.")
+        self._pay_b2b_btn.configure(fg=color, cursor="hand2")
+        self.after(3000, lambda: self._pay_b2b_btn.configure(fg=ACCENT))
+        if success:
+            try:
+                os.startfile(str(_HERE / "output" / "file filter" / "payment b2b"))
+            except Exception:
+                pass
+
+    def _pay_b2b_start(self):
+        if self._pay_b2b_running:
+            return
+        env = _read_env_raw()
+        input_folder = env.get("PAY_INPUT_FOLDER", "").strip()
+        if not input_folder:
+            self._pay_b2b_enqueue_log("[ERRORE] Seleziona la cartella di input prima di avviare.", "error")
+            return
+        _folder = Path(input_folder)
+        if not _folder.is_dir():
+            self._pay_b2b_enqueue_log(f"[ERRORE] Cartella non trovata: {input_folder}", "error")
+            return
+        import re as _re_chk
+        _PAY_CHK = _re_chk.compile(
+            r'^K[EG]_[A-Z0-9]{2}_([A-Z]_\d{10}|BC\d+|BU_\d+)_\d{8}\.csv$',
+            _re_chk.IGNORECASE)
+        if not any(_PAY_CHK.match(f.name) for f in _folder.glob("*.csv")):
+            self._pay_b2b_enqueue_log(
+                "[ERRORE] La cartella non contiene file Payments validi "
+                "(B2C: K[EG]_XX_X_NNNNNNNNNN_YYYYMMDD, "
+                "B2B: K[EG]_XX_BCN_YYYYMMDD, "
+                "Allocation: K[EG]_XX_BU_N_YYYYMMDD).", "error")
+            return
+        self._pay_b2b_running = True
+        self._pay_b2b_btn.configure(fg=TEXT_SEC, cursor="arrow")
+        self._status_var.set("In esecuzione...")
+        _required = [
+            ("PAY_B2B_OUTPUT_SUBFOLDER", "Sottocartella output"),
+            ("PAY_B2B_ZIP_FILENAME",     "Nome ZIP"),
+            ("PAY_B2B_COL_REFERENCE",    "Reference col"),
+            ("PAY_B2B_COL_AMOUNT",       "Amount col"),
+            ("PAY_B2B_COL_PAYMENT_DATE", "Payment Date col"),
+        ]
+        for _key, _label in _required:
+            if not env.get(_key, "").strip():
+                self._pay_b2b_enqueue_log(
+                    f"[ERRORE] Proprietà '{_label}' ({_key}) non configurata — vai in Impostazioni → File Filter → Payments.", "error")
+                self._pay_b2b_running = False
+                self._pay_b2b_btn.configure(fg=TEXT_PRI, cursor="hand2")
+                self._status_var.set("Errore configurazione.")
+                return
+        cfg = {
+            "input_folder":      input_folder,
+            "output_subfolder":  env.get("PAY_B2B_OUTPUT_SUBFOLDER"),
+            "zip_filename":      env.get("PAY_B2B_ZIP_FILENAME"),
+            "filter_mode":       env.get("PAY_B2B_FILTER_MODE", "key_ref_date_type"),
+            "debug_keys":        env.get("PAY_B2B_DEBUG_KEYS", "false").lower() == "true",
+            "col_reference":     int(env.get("PAY_B2B_COL_REFERENCE")),
+            "col_amount":        int(env.get("PAY_B2B_COL_AMOUNT")),
+            "col_payment_date":  int(env.get("PAY_B2B_COL_PAYMENT_DATE")),
+        }
+        threading.Thread(
+            target=pay_b2b_run_pipeline,
+            args=(cfg, self._pay_b2b_enqueue_log, self._pay_b2b_on_done),
             daemon=True,
         ).start()
 
